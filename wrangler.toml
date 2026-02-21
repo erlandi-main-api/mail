@@ -2,12 +2,25 @@ name = "erlandi-temp-mail"
 main = "src/worker.js"
 compatibility_date = "2026-02-22"
 
+# =========================
+# Runtime Variables
+# =========================
 [vars]
 DOMAIN = "erlandi.my.id"
 TTL_SECONDS = "3600"
 INBOX_PREFIX = "tmp-"
 
+# =========================
+# Custom Domain (Subdomain Web UI)
+# =========================
+[[routes]]
+pattern = "mail.erlandi.my.id"
+custom_domain = true
+
+# =========================
+# D1 Database Binding
+# =========================
 [[d1_databases]]
 binding = "DB"
 database_name = "erlandi_temp_mail"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "dbeb99d3-e77c-4c56-b218-72bf35d63ef9"

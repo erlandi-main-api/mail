@@ -1,7 +1,12 @@
 /**
  * Erlandi Temp Mail
  * Cloudflare Worker (Email + HTTP) + D1
- * Compatible with schema.sql (message_key NOT NULL, html_body available)
+ * - UI + API
+ * - Email Routing -> Worker -> D1
+ *
+ * Notes:
+ * - Requires D1 binding name: DB
+ * - Env vars: DOMAIN, INBOX_PREFIX, TTL_SECONDS
  */
 
 function nowSec() {
@@ -47,11 +52,13 @@ async function sha256Hex(str) {
 
 async function cleanupExpired(env) {
   const t = nowSec();
+  // delete messages for expired inboxes
   await env.DB.prepare(`
     DELETE FROM messages
     WHERE inbox_id IN (SELECT id FROM inboxes WHERE expires_at <= ?)
   `).bind(t).run();
 
+  // delete expired inboxes
   await env.DB.prepare(`DELETE FROM inboxes WHERE expires_at <= ?`)
     .bind(t)
     .run();
@@ -61,12 +68,12 @@ async function readEmailBodies(message) {
   let textBody = null;
   let htmlBody = null;
 
-  // text()
+  // plain text
   try {
     textBody = await message.text();
   } catch {}
 
-  // naive HTML capture from raw()
+  // naive HTML capture from raw
   try {
     const raw = await message.raw();
     const rawStr = new TextDecoder().decode(raw);
@@ -92,7 +99,7 @@ async function handleApi(request, env) {
 
   await cleanupExpired(env);
 
-  // POST /api/inbox -> create new inbox address
+  // POST /api/inbox
   if (request.method === "POST" && path === "/api/inbox") {
     const token = randomToken(24);
     const local = randomLocalPart(env.INBOX_PREFIX || "tmp-", 8);
@@ -316,7 +323,7 @@ export default {
     const prefix = (env.INBOX_PREFIX || "tmp-").toLowerCase();
     const domain = (env.DOMAIN || "").toLowerCase();
 
-    // only accept tmp-*@erlandi.my.id
+    // only accept tmp-*@domain
     if (!to.endsWith("@" + domain) || !to.startsWith(prefix)) return;
 
     const inbox = await env.DB.prepare(
@@ -326,9 +333,8 @@ export default {
     if (!inbox) return;
     if (inbox.expires_at <= nowSec()) return;
 
-    // message_key required by schema.sql (NOT NULL + unique)
-    const hdrId = message.headers?.get?.("Message-ID") || "";
-    const keyBase = \`\${hdrId}|\${message.from}|\${message.to}|\${message.subject||""}\`;
+    const messageId = message.headers ? (message.headers.get("Message-ID") || "") : "";
+    const keyBase = `${messageId}|${message.from || ""}|${message.to || ""}|${message.subject || ""}`;
     const messageKey = await sha256Hex(keyBase);
 
     const id = crypto.randomUUID();
@@ -352,8 +358,8 @@ export default {
         textBody,
         htmlBody
       ).run();
-    } catch (e) {
-      // duplicate message_key or other insert errors -> ignore
+    } catch {
+      // ignore duplicates / constraint errors
     }
   },
 
@@ -361,11 +367,13 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname.startsWith("/api/")) return handleApi(request, env);
+
     if (url.pathname === "/") {
       return new Response(renderUiHtml(), {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
+
     return new Response("Not found", { status: 404 });
   },
 };

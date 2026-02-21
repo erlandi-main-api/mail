@@ -1,0 +1,13 @@
+name = "erlandi-temp-mail"
+main = "src/worker.js"
+compatibility_date = "2026-02-22"
+
+[vars]
+DOMAIN = "erlandi.my.id"
+TTL_SECONDS = "3600"
+INBOX_PREFIX = "tmp-"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "erlandi_temp_mail"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"

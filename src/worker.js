@@ -1,129 +1,93 @@
 /**
- * Erlandi Temp Mail (Simple)
- * - Email Routing -> Email Worker -> D1
- * - HTTP API + simple UI on "/"
- *
- * Safety:
- * - Only processes INBOX_PREFIX (tmp-)
- * - Only inboxes created via POST /api/inbox
- * - TTL cleanup
- * - Idempotency (message_key)
- * - HTML viewer sandboxed iframe
+ * Erlandi Temp Mail
+ * Cloudflare Worker + D1 + Email Routing
  */
 
-function nowSec() { return Math.floor(Date.now() / 1000); }
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
 
 function randomToken(len = 24) {
   const bytes = new Uint8Array(len);
   crypto.getRandomValues(bytes);
-  const b64 = btoa(String.fromCharCode(...bytes))
-    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-  return b64.slice(0, len);
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "")
+    .slice(0, len);
 }
 
-function randomLocalPart(prefix, n = 8) {
+function randomLocal(prefix, len = 8) {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const bytes = new Uint8Array(n);
-  crypto.getRandomValues(bytes);
   let s = "";
-  for (let i = 0; i < n; i++) s += chars[bytes[i] % chars.length];
-  return `${prefix}${s}`;
+  const bytes = new Uint8Array(len);
+  crypto.getRandomValues(bytes);
+  for (let i = 0; i < len; i++) {
+    s += chars[bytes[i] % chars.length];
+  }
+  return prefix + s;
 }
 
-function json(data, status = 200, extraHeaders = {}) {
+function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      ...extraHeaders,
-    },
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    }
   });
 }
 
-function bad(status, message) { return json({ error: message }, status); }
+/* ================= EMAIL HANDLER ================= */
 
-// CORS
-function corsHeaders() {
-  return {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type",
-  };
-}
-function withCors(resp) {
-  const h = new Headers(resp.headers);
-  for (const [k, v] of Object.entries(corsHeaders())) h.set(k, v);
-  return new Response(resp.body, { status: resp.status, headers: h });
-}
-async function handleOptions() {
-  return new Response(null, { status: 204, headers: corsHeaders() });
-}
+async function handleEmail(message, env) {
+  const to = message.to?.toLowerCase() || "";
+  const domain = env.DOMAIN.toLowerCase();
+  const prefix = env.INBOX_PREFIX.toLowerCase();
 
-// Cleanup expired inboxes/messages
-async function cleanupExpired(env) {
-  const t = nowSec();
-  await env.DB.prepare(`
-    DELETE FROM messages
-    WHERE inbox_id IN (SELECT id FROM inboxes WHERE expires_at <= ?)
-  `).bind(t).run();
+  if (!to.endsWith("@" + domain)) return;
+  if (!to.startsWith(prefix)) return;
 
-  await env.DB.prepare(`DELETE FROM inboxes WHERE expires_at <= ?`)
-    .bind(t).run();
-}
+  const inbox = await env.DB.prepare(
+    "SELECT id, expires_at FROM inboxes WHERE address = ?"
+  ).bind(message.to).first();
 
-// Very simple body extract
-async function readEmailBodies(message) {
-  let textBody = null;
-  let htmlBody = null;
+  if (!inbox) return;
+  if (inbox.expires_at <= nowSec()) return;
 
-  try { textBody = await message.text(); } catch (_) {}
+  const id = crypto.randomUUID();
+  const received = nowSec();
 
-  // Naive HTML extraction (good enough for "simple")
+  let textBody = "";
   try {
-    const raw = await message.raw();
-    const rawStr = new TextDecoder().decode(raw);
-    const marker = "Content-Type: text/html";
-    const idx = rawStr.toLowerCase().indexOf(marker.toLowerCase());
-    if (idx !== -1) {
-      const slice = rawStr.slice(idx);
-      const bodyStart = slice.indexOf("\r\n\r\n");
-      if (bodyStart !== -1) {
-        htmlBody = slice.slice(bodyStart + 4).trim();
-        if (htmlBody.length > 200_000) htmlBody = htmlBody.slice(0, 200_000);
-      }
-    }
-  } catch (_) {}
+    textBody = await message.text();
+  } catch {}
 
-  if (textBody && textBody.length > 200_000) textBody = textBody.slice(0, 200_000);
-  return { textBody, htmlBody };
+  await env.DB.prepare(`
+    INSERT INTO messages (id, inbox_id, mail_from, rcpt_to, subject, received_at, text_body)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    id,
+    inbox.id,
+    message.from || "",
+    message.to || "",
+    message.subject || "",
+    received,
+    textBody
+  ).run();
 }
 
-async function sha256Hex(str) {
-  const bytes = new TextEncoder().encode(str);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
+/* ================= API HANDLER ================= */
 
-// API
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  await cleanupExpired(env);
-
-  if (request.method === "OPTIONS") return handleOptions();
-
-  // POST /api/inbox
   if (request.method === "POST" && path === "/api/inbox") {
-    const token = randomToken(24);
-    const local = randomLocalPart(env.INBOX_PREFIX || "tmp-", 8);
-    const address = `${local}@${env.DOMAIN}`;
+    const token = randomToken();
+    const address = randomLocal(env.INBOX_PREFIX) + "@" + env.DOMAIN;
     const created = nowSec();
-    const ttl = parseInt(env.TTL_SECONDS || "3600", 10);
-    const expires = created + (Number.isFinite(ttl) ? ttl : 3600);
+    const expires = created + parseInt(env.TTL_SECONDS);
 
     await env.DB.prepare(`
       INSERT INTO inboxes (id, address, created_at, expires_at)
@@ -133,280 +97,148 @@ async function handleApi(request, env) {
     return json({ token, address, expiresAt: expires });
   }
 
-  // GET /api/inbox/:token/messages
-  const inboxMatch = path.match(/^\/api\/inbox\/([A-Za-z0-9\-_]{10,})\/messages$/);
+  const inboxMatch = path.match(/^\/api\/inbox\/(.+)\/messages$/);
   if (request.method === "GET" && inboxMatch) {
     const token = inboxMatch[1];
 
     const inbox = await env.DB.prepare(
-      `SELECT id, address, created_at, expires_at FROM inboxes WHERE id = ?`
+      "SELECT id FROM inboxes WHERE id = ?"
     ).bind(token).first();
 
-    if (!inbox) return bad(404, "Inbox not found or expired");
+    if (!inbox) return json({ messages: [] });
 
     const rows = await env.DB.prepare(`
       SELECT id, mail_from as mailFrom, subject, received_at as receivedAt
       FROM messages
       WHERE inbox_id = ?
       ORDER BY received_at DESC
-      LIMIT 50
     `).bind(token).all();
 
-    return json({ inbox, messages: rows.results || [] });
+    return json({ messages: rows.results });
   }
 
-  // GET /api/message/:id
-  const msgMatch = path.match(/^\/api\/message\/([A-Za-z0-9\-_:.]{10,})$/);
+  const msgMatch = path.match(/^\/api\/message\/(.+)$/);
   if (request.method === "GET" && msgMatch) {
     const id = msgMatch[1];
 
     const row = await env.DB.prepare(`
-      SELECT id,
-             inbox_id as inboxId,
-             mail_from as mailFrom,
-             rcpt_to as rcptTo,
-             subject,
-             received_at as receivedAt,
-             text_body as textBody,
-             html_body as htmlBody
-      FROM messages
-      WHERE id = ?
+      SELECT id, mail_from as mailFrom, rcpt_to as rcptTo,
+             subject, received_at as receivedAt, text_body as textBody
+      FROM messages WHERE id = ?
     `).bind(id).first();
 
-    if (!row) return bad(404, "Message not found");
-    return json(row);
+    return json(row || {});
   }
 
-  return bad(404, "Not found");
+  return json({ error: "Not found" }, 404);
 }
 
-// UI
-function renderUiHtml() {
-  return `<!doctype html>
+/* ================= UI ================= */
+
+function renderUi() {
+  return `<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Erlandi Temp Mail</title>
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:20px;max-width:1000px}
-    .row{display:flex;gap:16px;flex-wrap:wrap}
-    .card{border:1px solid #ddd;border-radius:12px;padding:12px}
-    .left{flex:1;min-width:320px}
-    .right{flex:2;min-width:320px}
-    button{padding:8px 10px;border-radius:10px;border:1px solid #ccc;background:#fff;cursor:pointer}
-    input{padding:8px 10px;border-radius:10px;border:1px solid #ccc;width:100%}
-    ul{list-style:none;padding:0;margin:0}
-    li{padding:10px;border-bottom:1px solid #eee;cursor:pointer}
-    li:hover{background:#fafafa}
-    small{color:#666}
-    pre{white-space:pre-wrap;word-break:break-word}
-    iframe{width:100%;height:420px;border:1px solid #eee;border-radius:10px}
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Erlandi Temp Mail</title>
+<style>
+body{
+  margin:0;
+  font-family:system-ui;
+  background:#0f172a;
+  color:#fff;
+}
+.container{max-width:900px;margin:auto;padding:20px;}
+.card{background:#1e293b;padding:16px;border-radius:14px;margin-bottom:16px;}
+button{padding:8px 14px;border-radius:10px;border:none;background:#3b82f6;color:#fff;cursor:pointer;}
+input{width:100%;padding:8px;border-radius:10px;border:none;margin-top:6px;}
+.list{margin-top:10px;}
+.item{background:#334155;padding:10px;border-radius:10px;margin-bottom:6px;cursor:pointer;}
+.item:hover{background:#475569;}
+pre{white-space:pre-wrap;}
+</style>
 </head>
 <body>
-  <h2>Erlandi Temp Mail (simple)</h2>
+<div class="container">
+<h2>📧 Erlandi Temp Mail</h2>
 
-  <div class="card">
-    <button id="btnNew">New Address</button>
-    <button id="btnRefresh" disabled>Refresh</button>
-    <label style="margin-left:8px">
-      <input id="auto" type="checkbox" checked/> Auto refresh
-    </label>
+<div class="card">
+<button id="newBtn">New Address</button>
+<button id="refreshBtn" disabled>Refresh</button>
+<div style="margin-top:10px">
+<input id="address" readonly placeholder="Click New Address"/>
+<div id="expires"></div>
+</div>
+</div>
 
-    <div style="margin-top:10px">
-      <div><small>Address</small></div>
-      <input id="addr" readonly placeholder="Click New Address"/>
-      <div style="margin-top:6px"><small>Expires</small> <span id="exp">-</span></div>
-    </div>
-  </div>
+<div class="card">
+<h3>Inbox</h3>
+<div id="list" class="list"></div>
+</div>
 
-  <div class="row" style="margin-top:14px">
-    <div class="card left">
-      <b>Inbox</b>
-      <ul id="list" style="margin-top:10px"></ul>
-    </div>
-
-    <div class="card right">
-      <b>Message</b>
-      <div id="meta" style="margin-top:10px"></div>
-
-      <div style="margin-top:10px">
-        <button id="viewText" disabled>Text</button>
-        <button id="viewHtml" disabled>HTML (sandbox)</button>
-      </div>
-
-      <div id="viewer" style="margin-top:10px"></div>
-    </div>
-  </div>
+<div class="card">
+<h3>Message</h3>
+<div id="meta"></div>
+<pre id="viewer"></pre>
+</div>
+</div>
 
 <script>
-let token=null, timer=null, currentMsg=null;
-
-const addrEl=document.getElementById('addr');
-const expEl=document.getElementById('exp');
-const listEl=document.getElementById('list');
-const metaEl=document.getElementById('meta');
-const viewer=document.getElementById('viewer');
-const btnRefresh=document.getElementById('btnRefresh');
-const btnNew=document.getElementById('btnNew');
-const auto=document.getElementById('auto');
-const viewText=document.getElementById('viewText');
-const viewHtml=document.getElementById('viewHtml');
-
-function fmtTime(sec){
-  const d=new Date(sec*1000);
-  return d.toLocaleString();
-}
-function escapeHtml(s){
-  return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
-}
+let token=null;
 
 async function newInbox(){
   const r=await fetch('/api/inbox',{method:'POST'});
   const j=await r.json();
   token=j.token;
-  addrEl.value=j.address;
-  expEl.textContent=fmtTime(j.expiresAt);
-  btnRefresh.disabled=false;
-  await refresh();
+  address.value=j.address;
+  expires.innerText="Expires: "+new Date(j.expiresAt*1000).toLocaleString();
+  refreshBtn.disabled=false;
+  refresh();
 }
 
 async function refresh(){
-  if(!token) return;
+  if(!token)return;
   const r=await fetch('/api/inbox/'+token+'/messages');
   const j=await r.json();
-  if(j.error){
-    listEl.innerHTML='<li><small>'+escapeHtml(j.error)+'</small></li>';
-    return;
-  }
-  renderList(j.messages||[]);
-}
-
-function renderList(msgs){
-  listEl.innerHTML='';
-  if(msgs.length===0){
-    listEl.innerHTML='<li><small>No messages yet</small></li>';
-    return;
-  }
-  msgs.forEach(m=>{
-    const li=document.createElement('li');
-    li.innerHTML =
-      '<div><b>' + escapeHtml(m.subject||'(no subject)') + '</b></div>' +
-      '<div><small>' + escapeHtml(m.mailFrom||'') + ' • ' + fmtTime(m.receivedAt) + '</small></div>';
-    li.onclick=()=>openMessage(m.id);
-    listEl.appendChild(li);
+  list.innerHTML="";
+  (j.messages||[]).forEach(m=>{
+    const div=document.createElement("div");
+    div.className="item";
+    div.innerHTML="<b>"+(m.subject||"(no subject)")+"</b><br>"+(m.mailFrom||"");
+    div.onclick=()=>openMessage(m.id);
+    list.appendChild(div);
   });
 }
 
 async function openMessage(id){
   const r=await fetch('/api/message/'+id);
   const j=await r.json();
-  if(j.error){ return; }
-  currentMsg=j;
-
-  metaEl.innerHTML =
-    '<div><small>From:</small> ' + escapeHtml(j.mailFrom||'-') + '</div>' +
-    '<div><small>To:</small> ' + escapeHtml(j.rcptTo||'-') + '</div>' +
-    '<div><small>Subject:</small> ' + escapeHtml(j.subject||'-') + '</div>' +
-    '<div><small>Received:</small> ' + fmtTime(j.receivedAt) + '</div>';
-
-  viewText.disabled=false;
-  viewHtml.disabled=false;
-  showText();
+  meta.innerHTML="From: "+(j.mailFrom||"");
+  viewer.innerText=j.textBody||"";
 }
 
-function showText(){
-  if(!currentMsg) return;
-  viewer.innerHTML='<pre>'+escapeHtml(currentMsg.textBody||'(no text)')+'</pre>';
-}
-function showHtml(){
-  if(!currentMsg) return;
-  const html = currentMsg.htmlBody || '<pre>(no html)</pre>';
-  const iframe=document.createElement('iframe');
-  iframe.setAttribute('sandbox','allow-same-origin');
-  viewer.innerHTML='';
-  viewer.appendChild(iframe);
-  iframe.srcdoc=html;
-}
-
-viewText.onclick=showText;
-viewHtml.onclick=showHtml;
-btnNew.onclick=newInbox;
-btnRefresh.onclick=refresh;
-
-function updateAuto(){
-  if(timer){ clearInterval(timer); timer=null; }
-  if(auto.checked){
-    timer=setInterval(refresh, 8000);
-  }
-}
-auto.onchange=updateAuto;
-updateAuto();
+newBtn.onclick=newInbox;
+refreshBtn.onclick=refresh;
 </script>
 </body>
 </html>`;
 }
 
+/* ================= EXPORT ================= */
+
 export default {
-  // Email handler (Email Workers)
-  async email(message, env, ctx) {
-    const to = (message.to || "").toLowerCase();
-    const prefix = (env.INBOX_PREFIX || "tmp-").toLowerCase();
-    const domain = (env.DOMAIN || "").toLowerCase();
-
-    // Only process tmp-*@domain
-    if (!to.endsWith("@" + domain) || !to.startsWith(prefix)) return;
-
-    const inbox = await env.DB.prepare(
-      `SELECT id, expires_at FROM inboxes WHERE address = ?`
-    ).bind(message.to).first();
-
-    if (!inbox) return;
-    if (inbox.expires_at <= nowSec()) return;
-
-    const hdrMsgId = message.headers?.get?.("Message-ID") || "";
-    const keyBase = `${hdrMsgId}|${message.from}|${message.to}|${message.subject || ""}`;
-    const messageKey = await sha256Hex(keyBase);
-
-    const id = crypto.randomUUID();
-    const received = nowSec();
-    const { textBody, htmlBody } = await readEmailBodies(message);
-
-    try {
-      await env.DB.prepare(`
-        INSERT INTO messages (id, inbox_id, message_key, mail_from, rcpt_to, subject, received_at, text_body, html_body)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        id, inbox.id, messageKey,
-        message.from || null,
-        message.to || null,
-        message.subject || null,
-        received,
-        textBody,
-        htmlBody
-      ).run();
-    } catch (_) {
-      // duplicate message_key -> ignore
-    }
+  async email(message, env) {
+    await handleEmail(message, env);
   },
 
-  // HTTP handler
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
-
-    if (request.method === "OPTIONS") return handleOptions();
-
     if (url.pathname.startsWith("/api/")) {
-      return withCors(await handleApi(request, env));
+      return handleApi(request, env);
     }
-
-    if (url.pathname === "/") {
-      return new Response(renderUiHtml(), {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
-    }
-
-    return new Response("Not found", { status: 404 });
-  },
+    return new Response(renderUi(), {
+      headers: { "content-type": "text/html" }
+    });
+  }
 };
